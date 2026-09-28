@@ -1,0 +1,9 @@
+Package: com.yourname.qiangdanauto
+Name: QiangDanAuto
+Depends: mobilesubstrate
+Version: 1.0
+Architecture: iphoneos-arm
+Description: 自动确认抢单
+Maintainer: You
+Author: You
+Section: Tweaks

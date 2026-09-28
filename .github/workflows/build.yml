@@ -1,0 +1,45 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # 新增 dpkg (用于生成 deb) 和 xz (处理解压缩)
+        run: brew install ldid dpkg xz
+
+      - name: Setup Theos
+        run: git clone --recursive https://github.com/theos/theos.git $THEOS
+
+      - name: Download iOS SDK
+        run: |
+          # 确保 sdks 文件夹已创建，防止解压报错
+          mkdir -p $THEOS/sdks
+          
+          gh release download \
+            --repo theos/sdks \
+            --pattern "iPhoneOS16.5.sdk.tar.xz" \
+            --output sdk.tar.xz
+            
+          tar -xf sdk.tar.xz -C $THEOS/sdks/
+
+      - name: Build Tweak
+        # 加上 clean 确保干净构建
+        run: make clean package FINALPACKAGE=1
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QiangDanAuto-deb
+          # 如果你的 Makefile 中没有明确指定存放目录，默认就是在 packages 下
+          path: packages/*.deb
