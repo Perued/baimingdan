@@ -3,7 +3,7 @@ INSTALL_TARGET_PROCESSES = com.dada.staff
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = QiangDanAuto
+TWEAK_NAME = baimingdan
 QiangDanAuto_FILES = Tweak.x
 QiangDanAuto_CFLAGS = -fobjc-arc
 
