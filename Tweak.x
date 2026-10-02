@@ -8,11 +8,20 @@
 //     原因: 8.0.75 签名可能与 8.0.74 不同; 对整数发 description 会
 //     EXC_BAD_ACCESS, 且 @try/@catch 拦不住 Mach 异常。
 //   - %ctor 记录当前 App 版本, 便于排查版本漂移 (8.0.74 方法表 vs 运行版本)。
+// v3.2 (2026-10-02):
+//   - loadSetting 纠正: 反汇编 8.0.74 的 +loadSetting 证实为纯本地配置文件
+//     加载 (getJailbreakPath -> FileExist -> dataWithContentsOfFile ->
+//     decodeObjectOfClass:fromData:, 无网络请求), 日志类别由 [DOWNLINK]
+//     改为 [CONFIG]。服务端下发走 onPackageDownloadFinish:package:。
+// v3.1 (2026-10-02):
+//   - 新增启动后 hook 健康自检: 延迟 3 秒在后台队列执行, 逐个验证 27 个
+//     hook 目标方法是否存在 (存在 => %hook 已挂上), 结果写入 [HEALTH] 日志。
 //
 // 分析基础: 8.0.74 二进制静态分析 (JailBreakHelper / ClientCheckMgr 方法表逐类验证)
 // 日志: 沙盒 Documents/WCNorisk_intercept.log (8MB 轮转)
 // 类别: DETECT=检测 verdict/采集被中和, UPLOAD=上报被拦截(含数据),
-//       DOWNLINK=服务端下发被丢弃(含数据)
+//       DOWNLINK=服务端下发被丢弃(含数据), CONFIG=本地检测配置加载被跳过,
+//       HEALTH=hook 健康自检
 //
 // 设计原则 (业务不断):
 //   1. 只动检测 verdict / 采集 / 上报 / 下发,不动业务逻辑
@@ -229,7 +238,13 @@ static NSString *wc_formatArgs(id self, SEL sel, unsigned long long *raw, int ma
            wc_safeDesc(arg1));
 }
 + (void)loadSetting {
-    wc_log(@"DOWNLINK", @"JailBreakHelper +loadSetting 被调用 -> 跳过(含服务端设置包)");
+    // 反汇编 8.0.74 确认: 纯本地配置文件加载, 无网络请求。
+    // getJailbreakPath(沙盒路径) -> FileExist -> dataWithContentsOfFile ->
+    // decodeObjectOfClass:fromData:(反序列化出检测路径配置);
+    // 文件不存在则 CreateFile 建默认配置 -> encodeDataWithObject -> writeToFile 写回。
+    // 服务端下发走 onPackageDownloadFinish:package: 那条 (已另行拦截)。
+    // 跳过 = 检测模块拿不到检测路径 (IsJailBreak 本来也直接返回 NO, 双保险)。
+    wc_log(@"CONFIG", @"JailBreakHelper +loadSetting 被调用 -> 跳过本地检测配置加载");
 }
 
 - (BOOL)isOverADay { return NO; } // 永不触发"重新检查", 低频, 不记日志
@@ -318,14 +333,73 @@ static NSString *wc_formatArgs(id self, SEL sel, unsigned long long *raw, int ma
 
 %end
 
-#pragma mark - 3. 加载标记
+#pragma mark - 4. 启动自检 (hook 健康度)
+// 延迟到启动后执行, 不占启动路径。只做存在性检查:
+// 方法存在 => Logos %hook 已挂上 (不存在的方法 %hook 会静默跳过)。
+// 注意: 这只能证明"挂上了", 不能证明"服务端下发了检查任务"。
+static void wc_healthCheck(void) {
+    @autoreleasepool {
+        struct { const char *cls; const char *sel; BOOL isClass; } items[] = {
+            {"JailBreakHelper", "JailBroken", YES},
+            {"JailBreakHelper", "IsJailBreak", NO},
+            {"JailBreakHelper", "HasInstallJailbreakPlugin:", NO},
+            {"JailBreakHelper", "getJailbreakPath", YES},
+            {"JailBreakHelper", "getJailbreakRootDir", YES},
+            {"JailBreakHelper", "getIAPCheckPath", YES},
+            {"JailBreakHelper", "m_checkPaths", NO},
+            {"JailBreakHelper", "setM_checkPaths:", NO},
+            {"JailBreakHelper", "loadSetting", YES},
+            {"JailBreakHelper", "isOverADay", NO},
+            {"JailBreakHelper", "save", NO},
+            {"JailBreakHelper", "onPackageDownloadFinish:package:", NO},
+            {"JailBreakHelper", "onPackageListUpdated:", NO},
+            {"ClientCheckMgr", "onAuthOK", NO},
+            {"ClientCheckMgr", "getImageList", NO},
+            {"ClientCheckMgr", "checkConsistency:", NO},
+            {"ClientCheckMgr", "reportFileConsistency:fileName:offset:bufferSize:seq:", NO},
+            {"ClientCheckMgr", "checkHook:", NO},
+            {"ClientCheckMgr", "checkHookWithSeq:", NO},
+            {"ClientCheckMgr", "reportAppList:", NO},
+            {"ClientCheckMgr", "OnGetNewXmlMsg:Type:MsgWrap:", NO},
+            {"ClientCheckMgr", "addImage:", NO},
+            {"ClientCheckMgr", "registerAddImageCallBack", NO},
+            {"ClientCheckMgr", "runningProcesses", NO},
+            {"ClientCheckMgr", "clientCheckData", NO},
+            {"ClientCheckMgr", "setClientCheckData:", NO},
+        };
+        int n = (int)(sizeof(items) / sizeof(items[0]));
+        NSMutableString *miss = [NSMutableString string];
+        int okCount = 0;
+        for (int i = 0; i < n; i++) {
+            Class cls = objc_getClass(items[i].cls);
+            BOOL found = NO;
+            if (cls) {
+                Class c = items[i].isClass ? object_getClass(cls) : cls;
+                found = (class_getInstanceMethod(c, sel_registerName(items[i].sel)) != NULL);
+            }
+            if (found) okCount++;
+            else [miss appendFormat:@"%s[%s%s] ", items[i].cls, items[i].isClass ? "+" : "-", items[i].sel];
+        }
+        wc_log(@"HEALTH", @"自检: %d/%d 个方法存在并已 hook; 缺失: %s",
+               okCount, n, miss.length ? [miss UTF8String] : "无");
+        if (miss.length)
+            wc_log(@"HEALTH", @"注意: 缺失的方法其 hook 未生效 (当前版本类/方法不存在或改名), 对应检查项无覆盖");
+    }
+}
+
+#pragma mark - 5. 加载标记
 // v3: %ctor 只做日志与版本记录, 不做运行时扫描/方法替换。
 //     启动期零额外工作, 看门狗风险最低。
+// v3.1: 增加延迟 3 秒的 hook 健康自检 (后台队列, 不占启动路径)。
 %ctor {
     @autoreleasepool {
         NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
         NSString *build = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"];
-        wc_log(@"DETECT", @"WCNorisk v3 加载完成 (方法表基于 8.0.74, 当前运行 %@ build %@)",
+        wc_log(@"DETECT", @"WCNorisk v3.2 加载完成 (方法表基于 8.0.74, 当前运行 %@ build %@)",
                ver ? ver : @"?", build ? build : @"?");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+            wc_healthCheck();
+        });
     }
 }
