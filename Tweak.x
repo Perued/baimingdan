@@ -13,6 +13,8 @@
 //     加载 (getJailbreakPath -> FileExist -> dataWithContentsOfFile ->
 //     decodeObjectOfClass:fromData:, 无网络请求), 日志类别由 [DOWNLINK]
 //     改为 [CONFIG]。服务端下发走 onPackageDownloadFinish:package:。
+// v3.3 (2026-10-02):
+//   - HEALTH 自检输出已拦截的完整方法清单 (按类分组), 不只报缺失。
 // v3.1 (2026-10-02):
 //   - 新增启动后 hook 健康自检: 延迟 3 秒在后台队列执行, 逐个验证 27 个
 //     hook 目标方法是否存在 (存在 => %hook 已挂上), 结果写入 [HEALTH] 日志。
@@ -32,6 +34,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
+#import <string.h>
 
 #pragma mark - 日志工具
 
@@ -368,8 +371,10 @@ static void wc_healthCheck(void) {
             {"ClientCheckMgr", "setClientCheckData:", NO},
         };
         int n = (int)(sizeof(items) / sizeof(items[0]));
+        NSMutableString *okJB = [NSMutableString string];
+        NSMutableString *okCC = [NSMutableString string];
         NSMutableString *miss = [NSMutableString string];
-        int okCount = 0;
+        int okCount = 0, jbCount = 0, ccCount = 0;
         for (int i = 0; i < n; i++) {
             Class cls = objc_getClass(items[i].cls);
             BOOL found = NO;
@@ -377,13 +382,29 @@ static void wc_healthCheck(void) {
                 Class c = items[i].isClass ? object_getClass(cls) : cls;
                 found = (class_getInstanceMethod(c, sel_registerName(items[i].sel)) != NULL);
             }
-            if (found) okCount++;
-            else [miss appendFormat:@"%s[%s%s] ", items[i].cls, items[i].isClass ? "+" : "-", items[i].sel];
+            if (found) {
+                okCount++;
+                NSString *tag = [NSString stringWithFormat:@"%s%s ",
+                                 items[i].isClass ? "+" : "-", items[i].sel];
+                if (strcmp(items[i].cls, "JailBreakHelper") == 0) {
+                    [okJB appendString:tag]; jbCount++;
+                } else {
+                    [okCC appendString:tag]; ccCount++;
+                }
+            } else {
+                [miss appendFormat:@"%s[%s%s] ", items[i].cls,
+                 items[i].isClass ? "+" : "-", items[i].sel];
+            }
         }
-        wc_log(@"HEALTH", @"自检: %d/%d 个方法存在并已 hook; 缺失: %s",
-               okCount, n, miss.length ? [miss UTF8String] : "无");
-        if (miss.length)
+        wc_log(@"HEALTH", @"自检: %d/%d 个方法存在并已 hook", okCount, n);
+        wc_log(@"HEALTH", @"已拦截 JailBreakHelper(%d): %s", jbCount, [okJB UTF8String]);
+        wc_log(@"HEALTH", @"已拦截 ClientCheckMgr(%d): %s", ccCount, [okCC UTF8String]);
+        if (miss.length) {
+            wc_log(@"HEALTH", @"缺失(未 hook): %s", [miss UTF8String]);
             wc_log(@"HEALTH", @"注意: 缺失的方法其 hook 未生效 (当前版本类/方法不存在或改名), 对应检查项无覆盖");
+        } else {
+            wc_log(@"HEALTH", @"缺失: 无");
+        }
     }
 }
 
@@ -395,7 +416,7 @@ static void wc_healthCheck(void) {
     @autoreleasepool {
         NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
         NSString *build = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"];
-        wc_log(@"DETECT", @"WCNorisk v3.2 加载完成 (方法表基于 8.0.74, 当前运行 %@ build %@)",
+        wc_log(@"DETECT", @"WCNorisk v3.3 加载完成 (方法表基于 8.0.74, 当前运行 %@ build %@)",
                ver ? ver : @"?", build ? build : @"?");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
